@@ -18,19 +18,53 @@ import ballerina/http;
 import ballerina/log;
 import ballerinax/googleapis.gmail as gmail;
 
-service class HttpService {
+isolated service class HttpService {
+    private final gmail:GmailConfiguration & readonly gmailConfig;
+    private string startHistoryId;
+    private final string subscriptionResource;
+    private final HttpToGmailAdaptor adaptor;
 
-    private gmail:Client gmailClient;
-    public  string startHistoryId = "";
-    private string subscriptionResource;
-    private Dispatcher dispatcher;
+    private final boolean isOnNewEmail;
+    private final boolean isOnNewThread;
+    private final boolean isOnEmailLabelAdded;
+    private final boolean isOnEmailStarred;
+    private final boolean isOnEmailLabelRemoved;
+    private final boolean isOnEmailStarRemoved;
+    private final boolean isOnNewAttachment;
 
-    public isolated function init(SimpleHttpService|HttpService httpService, gmail:Client gmailClient, 
-        string historyId, string subscriptionResource) {
-        self.gmailClient = gmailClient;
+    isolated function init(HttpToGmailAdaptor adaptor, gmail:GmailConfiguration config, string historyId, 
+                                  string subscriptionResource) {
+        self.adaptor = adaptor;
+        self.gmailConfig = config.cloneReadOnly();
         self.startHistoryId = historyId;
         self.subscriptionResource = subscriptionResource;
-        self.dispatcher = new (httpService, self.gmailClient);
+
+        string[] methodNames = adaptor.getServiceMethodNames();
+        self.isOnNewEmail = isMethodAvailable("onNewEmail", methodNames);
+        self.isOnNewThread = isMethodAvailable("onNewThread", methodNames);
+        self.isOnEmailLabelAdded = isMethodAvailable("onEmailLabelAdded", methodNames);
+        self.isOnEmailStarred = isMethodAvailable("onEmailStarred", methodNames);
+        self.isOnEmailLabelRemoved = isMethodAvailable("onEmailLabelRemoved", methodNames);
+        self.isOnEmailStarRemoved = isMethodAvailable("onEmailStarRemoved", methodNames);
+        self.isOnNewAttachment = isMethodAvailable("onNewAttachment", methodNames);
+
+        if (methodNames.length() > 0) {
+            foreach string methodName in methodNames {
+                log:printError("Unrecognized method [" + methodName + "] found in user implementation."); 
+            }
+        }
+    }
+
+    public isolated function setStartHistoryId(string startHistoryId) {
+        lock {
+            self.startHistoryId = startHistoryId;
+        }  
+    }
+
+    public isolated function getStartHistoryId() returns string {
+        lock {
+            return self.startHistoryId;
+        }
     }
 
     isolated resource function post mailboxChanges(http:Caller caller, http:Request request) returns @tainted error? {
@@ -38,13 +72,13 @@ service class HttpService {
         string incomingSubscription = check ReqPayload.subscription;
 
         if (self.subscriptionResource === incomingSubscription) {
-            var  mailboxHistoryPage =  self.gmailClient->listHistory(self.startHistoryId);
+            var  mailboxHistoryPage =  self.listHistory(self.getStartHistoryId());
             if (mailboxHistoryPage is stream<gmail:History,error?>) {
                 var history = mailboxHistoryPage.next();
                 while (history is record {| gmail:History value; |}) {
-                    check self.dispatcher.dispatch(history.value);
-                    self.startHistoryId =<string> history.value?.historyId;
-                    log:printDebug(NEXT_HISTORY_ID+self.startHistoryId);
+                    check self.dispatch(history.value);
+                    self.setStartHistoryId(<string> history.value?.historyId);
+                    log:printDebug(NEXT_HISTORY_ID + self.getStartHistoryId());
                     history = mailboxHistoryPage.next();
                 }
             } else {
@@ -55,4 +89,212 @@ service class HttpService {
         }
         check caller->respond(http:STATUS_OK);
     }
+
+    isolated function dispatch(gmail:History history) returns @tainted error? {
+        if (history?.messagesAdded is gmail:HistoryEvent[] ) {
+            gmail:HistoryEvent[] newMessages = <gmail:HistoryEvent[]>history?.messagesAdded;
+            if ((newMessages.length()>0) && (self.isOnNewEmail || self.isOnNewAttachment || self.isOnNewThread)) {
+                foreach var newMessage in newMessages {
+                    if (newMessage.message?.labelIds is string[]) {
+                        foreach var labelId in <string[]>newMessage.message?.labelIds {
+                            match labelId{
+                                INBOX =>{
+                                    check self.dispatchNewMessage(newMessage);
+                                    if (self.isOnNewThread) {
+                                        check self.dispatchNewThread(newMessage);
+                                    }
+                                }
+                            }
+                        }  
+                    }        
+                 }
+            }
+        }
+        if (history?.labelsAdded is gmail:HistoryEvent[] ) {
+            gmail:HistoryEvent[] addedlabels = <gmail:HistoryEvent[]>history?.labelsAdded;
+            if ((addedlabels.length()>0) && (self.isOnEmailLabelAdded || self.isOnEmailStarred)) {
+                foreach var addedlabel in addedlabels {
+                    if (self.isOnEmailLabelAdded) {
+                        check self.dispatchLabelAddedEmail(addedlabel);
+                    }
+                    if (self.isOnEmailStarred) {
+                        check self.dispatchStarredEmail(addedlabel);
+                    }
+                }
+            }
+        }
+        if (history?.labelsRemoved is gmail:HistoryEvent[] ) {
+            gmail:HistoryEvent[] removedLabels = <gmail:HistoryEvent[]>history?.labelsRemoved;
+            if ((removedLabels.length()>0) && (self.isOnEmailLabelRemoved || self.isOnEmailStarRemoved)) {
+                foreach var removedLabel in removedLabels {
+                    if (self.isOnEmailLabelRemoved) {
+                        check self.dispatchLabelRemovedEmail(removedLabel);
+                    }
+                    if (self.isOnEmailStarRemoved) {
+                        check self.dispatchStarRemovedEmail(removedLabel);
+                    }
+                }
+            }
+        }
+    }
+
+    isolated function dispatchNewMessage(gmail:HistoryEvent newMessage) returns @tainted error? {
+        gmail:Message message = check self.readMessage(<@untainted>newMessage.message.id);
+        if (self.isOnNewEmail) {
+            check self.adaptor.callOnNewEmail(message);
+        }
+        if (self.isOnNewAttachment) {
+            if (message?.msgAttachments is gmail:MessageBodyPart[]) {
+                gmail:MessageBodyPart[] msgAttachments = <gmail:MessageBodyPart[]>message?.msgAttachments;
+                if (msgAttachments.length()>0) {
+                    check self.dispatchNewAttachment(msgAttachments, message);
+                }
+            }
+        }        
+    }
+
+    isolated function dispatchNewAttachment(gmail:MessageBodyPart[] msgAttachments, gmail:Message message) returns error? {
+        MailAttachment mailAttachment = {
+            messageId : message.id,
+            msgAttachments:  msgAttachments
+        };
+        check self.adaptor.callOnNewAttachment(mailAttachment);  
+    }
+
+    isolated function dispatchNewThread(gmail:HistoryEvent newMessage) returns @tainted error? {
+        if(newMessage.message.id == newMessage.message.threadId) {               
+            gmail:MailThread thread = check self.readThread(<@untainted>newMessage.message.threadId);
+            check self.adaptor.callOnNewThread(thread);
+        }
+    }
+
+    isolated function dispatchLabelAddedEmail(gmail:HistoryEvent addedlabel) returns @tainted error? {
+        ChangedLabel changedLabel = { messageDetail: {id : "", threadId : ""}, changedLabelId: []};
+        if (addedlabel?.labelIds is string []) {
+            changedLabel.changedLabelId = <string []>addedlabel?.labelIds;
+        }
+        gmail:Message message = check self.readMessage(<@untainted>addedlabel.message.id);
+        changedLabel.messageDetail = message;
+        check self.adaptor.callOnEmailLabelAdded(changedLabel);
+    }
+
+    isolated function dispatchStarredEmail(gmail:HistoryEvent addedlabel) returns @tainted error? {
+        if (addedlabel?.labelIds is string[]) {
+            foreach var label in <string[]>addedlabel?.labelIds {
+                match label{
+                    STARRED =>{
+                        gmail:Message message = check self.readMessage(<@untainted>addedlabel.message.id);
+                        check self.adaptor.callOnEmailStarred(message);
+                    }
+                }
+            }
+        }        
+    }
+
+    isolated function dispatchLabelRemovedEmail(gmail:HistoryEvent removedLabel) returns @tainted error?{
+        ChangedLabel changedLabel = { messageDetail: {id : "", threadId : ""}, changedLabelId: []};
+        if (removedLabel?.labelIds is string[]) {
+            changedLabel.changedLabelId = <string[]>removedLabel?.labelIds;
+        }
+        gmail:Message message = check self.readMessage(<@untainted>removedLabel.message.id);
+        changedLabel.messageDetail = message;
+        check self.adaptor.callOnEmailLabelRemoved(changedLabel);
+    }
+
+    isolated function dispatchStarRemovedEmail(gmail:HistoryEvent removedLabel) returns @tainted error? {
+        if (removedLabel?.labelIds is string[]) {
+            foreach var label in <string[]>removedLabel?.labelIds {
+                match label{
+                    STARRED =>{
+                        gmail:Message message = check self.readMessage(<@untainted>removedLabel.message.id);
+                        check self.adaptor.callOnEmailStarRemoved(message);
+                    }
+                }
+            }
+        }        
+    }
+
+    isolated function readMessage(string messageId, string? format = (), string[]? metadataHeaders = (),
+                                  string? userId = ()) returns @tainted gmail:Message|error {
+        string userEmailId = ME;                                     
+        if (userId is string) {
+            userEmailId = userId;
+        }                            
+        string uriParams = "";
+        //Append format query parameter
+        if (format is string) {
+            uriParams = check gmail:appendEncodedURIParameter(uriParams, gmail:FORMAT, format);
+        }
+        if (metadataHeaders is string[]) {
+            foreach string metaDataHeader in metadataHeaders {
+                uriParams = check gmail:appendEncodedURIParameter(uriParams, gmail:METADATA_HEADERS, metaDataHeader);
+            }
+        }
+        string readMessagePath = USER_RESOURCE + userEmailId + gmail:MESSAGE_RESOURCE + FORWARD_SLASH_SYMBOL + messageId 
+            + uriParams;
+        
+        http:Client httpClient = check getClient(self.gmailConfig);
+        http:Response httpResponse = <http:Response> check httpClient->get(readMessagePath);
+        //Get json message response. If unsuccessful, throws and returns error.
+        json jsonreadMessageResponse = check handleResponse(httpResponse);
+        //Transform the json mail response from Gmail API to Message type. If unsuccessful, throws and returns error.
+        return gmail:convertJSONToMessageType(<@untainted>jsonreadMessageResponse);
+    }
+
+    isolated function readThread(string threadId, string? format = (), string[]? metadataHeaders = (),
+                                 string? userId = ()) returns @tainted gmail:MailThread|error {
+        string userEmailId = ME; 
+        if (userId is string) {
+            userEmailId = userId;
+        }
+        string uriParams = "";
+        if (format is string) {
+            uriParams = check gmail:appendEncodedURIParameter(uriParams, gmail:FORMAT, format);
+        }
+        if (metadataHeaders is string[]) {
+            //Append the optional meta data headers as query parameters
+            foreach string metaDataHeader in metadataHeaders {
+                uriParams = check gmail:appendEncodedURIParameter(uriParams, gmail:METADATA_HEADERS, metaDataHeader);
+            }
+        }
+        string readThreadPath = USER_RESOURCE + userEmailId + gmail:THREAD_RESOURCE + FORWARD_SLASH_SYMBOL + threadId 
+                                + uriParams;
+
+        http:Client httpClient = check getClient(self.gmailConfig);                       
+        http:Response httpResponse = <http:Response> check httpClient->get(readThreadPath);
+        //Get json thread response. If unsuccessful, throws and returns error.
+        json jsonReadThreadResponse = check handleResponse(httpResponse);
+        //Transform json thread response from Gmail API to MailThread type. If unsuccessful, throws and returns error.
+        return gmail:convertJSONToThreadType(<@untainted>jsonReadThreadResponse);
+    }
+
+    isolated function listHistory(string startHistoryId, string[]? historyTypes = (), string? labelId = (),
+                                  string? maxResults = (), string? pageToken = (), string? userId = ()) returns @tainted
+                                  stream<gmail:History,error?>|error {
+        string userEmailId = ME; 
+        if (userId is string) {
+            userEmailId = userId;
+        }
+        http:Client httpClient = check getClient(self.gmailConfig);   
+        gmail:MailboxHistoryStream mailboxHistoryStream = check new gmail:MailboxHistoryStream (httpClient, userEmailId,
+                                                                                    startHistoryId, historyTypes,
+                                                                                    labelId, maxResults, pageToken);
+        return new stream<gmail:History,error?>(mailboxHistoryStream);
+    }
+}
+
+# Retrieves whether the particular remote method is available.
+#
+# + methodName - Name of the required method
+# + methods - All available methods
+# + return - `true` if method available or else `false`
+isolated function isMethodAvailable(string methodName, string[] methods) returns boolean {
+    boolean isAvailable = methods.indexOf(methodName) is int;
+    if (isAvailable) {
+        var index = methods.indexOf(methodName);
+        if (index is int) {
+            _ = methods.remove(index);
+        }
+    }
+    return isAvailable;
 }
