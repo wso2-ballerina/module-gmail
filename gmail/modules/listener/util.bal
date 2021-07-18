@@ -17,6 +17,7 @@
 import ballerina/log;
 import ballerina/uuid;
 import ballerina/http;
+import ballerinax/googleapis.gmail as gmail;
 
 type mapJson map<json>;
 isolated function createTopic(http:Client pubSubClient, string project, string pushEndpoint) 
@@ -218,4 +219,12 @@ isolated function stop(http:Client gmailHttpClient, string userId) returns @tain
     http:Request request = new;
     string stopPath = USER_RESOURCE + userId + STOP;
     http:Response httpResponse = <http:Response> check gmailHttpClient->post(stopPath, request);
+}
+
+isolated function getClient(gmail:GmailConfiguration config) returns http:Client|error {
+    http:ClientSecureSocket? socketConfig = config?.secureSocketConfig;
+    return check new (gmail:BASE_URL, {
+        auth: config.oauthClientConfig,
+        secureSocket: socketConfig
+    });
 }

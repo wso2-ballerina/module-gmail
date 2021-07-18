@@ -25,13 +25,13 @@ public class Listener {
     private string topicResource = "";
     private string subscriptionResource = "";    
     private string userId = ME;
-    private gmail:Client gmailClient;
+    private gmail:GmailConfiguration gmailConfig;
     private http:Listener httpListener;
     private string project;
     private string pushEndpoint;
 
     private WatchRequestBody requestBody={topicName:""};
-    private HttpService httpService;
+    private HttpService? httpService;
     http:Client pubSubClient;
     http:Client gmailHttpClient;
 
@@ -54,7 +54,7 @@ public class Listener {
 
         self.httpListener = check new (port);
         //Create gmail connector client.
-        self.gmailClient = new (gmailConfig);     
+        self.gmailConfig = gmailConfig;     
         self.project = project;
         self.pushEndpoint = pushEndpoint;
 
@@ -62,12 +62,15 @@ public class Listener {
         self.topicResource = topicSubscriptionDetail.topicResource;
         self.subscriptionResource = topicSubscriptionDetail.subscriptionResource;
         self.requestBody = {topicName: self.topicResource, labelIds: [INBOX], labelFilterAction : INCLUDE};
+
+        self.httpService = ();
     }
 
     public isolated function attach(service object {} s, string[]|string? name = ()) returns @tainted error? {
-        self.httpService = new HttpService(s, self.gmailClient, self.startHistoryId, self.subscriptionResource);
+        HttpToGmailAdaptor adaptor = check new (s);
+        self.httpService = new HttpService(adaptor, self.gmailConfig, self.startHistoryId, self.subscriptionResource);
         check self.watchMailbox();
-        check self.httpListener.attach(self.httpService, name);
+        check self.httpListener.attach(<HttpService>self.httpService, name);
         Job job = new (self);
         check job.scheduleNextWatchRenewal();
     }
@@ -96,7 +99,10 @@ public class Listener {
         WatchResponse  response = check watch(self.gmailHttpClient, self.userId, self.requestBody);
         self.startHistoryId = response.historyId;
         log:printInfo(NEW_HISTORY_ID + self.startHistoryId);
-        self.httpService.startHistoryId = self.startHistoryId;
+        HttpService? httpService = self.httpService;
+        if (httpService is HttpService) {
+            httpService.setStartHistoryId(self.startHistoryId);
+        }  
     }    
 }
 
